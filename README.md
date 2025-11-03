@@ -1,6 +1,4 @@
-# ai-translate
-
-Chrome extension: https://chromewebstore.google.com/detail/ai-Grammar/onpkcfbffddilhhehhnngjeabnbplkmg?authuser=0&hl=en
+# ai-grammar
 
 ## Privacy Policy
 
