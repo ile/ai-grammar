@@ -1,0 +1,339 @@
+// background.js
+const MODELS = [
+	'gemini-2.5-flash',
+	'gemini-2.5-flash-lite-preview-09-2025',
+	'gemini-1.5-flash',
+	'gemini-pro'
+];
+
+// Log forwarding helper
+function logToPopup(message, level = 'log') {
+	chrome.runtime.sendMessage({
+		action: 'debugLog',
+		message: `[BG] ${message}`,
+		level
+	}).catch(err => {
+		if (!err.message.includes('Receiving end does not exist')) {
+			console.error('Log forwarding error:', err);
+		}
+	});
+}
+
+logToPopup('🔥 Background script loaded');
+
+// Initialize context menu with safety checks
+function initializeContextMenu() {
+	if (!chrome.contextMenus) {
+		logToPopup('ContextMenus API unavailable - skipping initialization', 'warn');
+		return;
+	}
+
+	try {
+		chrome.contextMenus.remove('translateWithAI', () => {
+			if (chrome.runtime.lastError) {
+				logToPopup(`Context menu remove failed: ${chrome.runtime.lastError.message}`, 'warn');
+			}
+			chrome.contextMenus.create({
+				id: "translateWithAI",
+				title: "Check Grammar",
+				contexts: ["selection"]
+			}, () => {
+				if (chrome.runtime.lastError) {
+					logToPopup(`Context menu creation failed: ${chrome.runtime.lastError.message}`, 'error');
+				} else {
+					logToPopup('Context menu initialized successfully');
+				}
+			});
+		});
+	} catch (error) {
+		logToPopup(`Context menu setup error: ${error.message}`, 'error');
+	}
+}
+
+// Lifecycle events
+chrome.runtime.onInstalled.addListener(() => {
+	logToPopup('Extension installed');
+	initializeContextMenu();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+	logToPopup('Chrome started - background active');
+	initializeContextMenu();
+});
+
+// Message handler
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+	logToPopup(`Message received: ${request.action}`);
+
+	if (request.action === 'wake') {
+		logToPopup('Background woken by popup');
+		sendResponse({ status: 'awake' });
+		return true;
+	}
+
+	if (request.action === 'translateText') {
+		translateText(request.text)
+			.then(result => sendResponse({ result: String(result) }))
+			.catch(error => sendResponse({ error: error.message, stack: error.stack }));
+		return true;
+	}
+});
+
+// Context menu handler
+if (chrome.contextMenus) {
+	// Track state per tab
+	const tabStates = new Map();
+
+	chrome.contextMenus.onClicked.addListener((info, tab) => {
+		const currentTime = Date.now();
+		const tabId = tab?.id;
+		if (!tabId) {
+			console.error('Invalid tab ID');
+			logToPopup('Invalid tab ID', 'error');
+			return;
+		}
+
+		// Initialize tab state if not exists
+		if (!tabStates.has(tabId)) {
+			tabStates.set(tabId, {
+				lastClickTime: 0,
+				scriptsInjected: false,
+				isTranslating: false
+			});
+		}
+		const tabState = tabStates.get(tabId);
+
+		// Debounce clicks
+		const debounceDelay = 2000; // 2 seconds
+		if (currentTime - tabState.lastClickTime < debounceDelay) {
+			console.log('Debounced context menu click, ignoring');
+			logToPopup('Debounced context menu click, ignoring', 'warn');
+			return;
+		}
+
+		// Prevent multiple simultaneous translations
+		if (tabState.isTranslating) {
+			console.log('🚫 Translation already in progress for this tab, ignoring click');
+			return;
+		}
+
+		tabState.lastClickTime = currentTime;
+
+		if (info.menuItemId === 'translateWithAI' && info.selectionText && info.frameId === 0) {
+			console.log('🎯 Context menu clicked - translating selection:', info.selectionText.substring(0, 50));
+
+			// Set translating flag
+			tabState.isTranslating = true;
+
+			// Inject scripts only once
+			const injectScripts = () => {
+				if (!tabState.scriptsInjected) {
+					console.log('Injecting scripts for tab:', tabId);
+					tabState.scriptsInjected = true;
+					return chrome.scripting.executeScript({
+						target: { tabId, frameIds: [0] },
+						files: ['custom-elements-polyfill.js', 'overlay.js']
+					}).catch(err => {
+						console.error('Overlay script injection failed:', err.message);
+						logToPopup(`Overlay script injection failed: ${err.message}`, 'error');
+						tabState.scriptsInjected = false;
+						throw err;
+					});
+				}
+				console.log('Scripts already injected for tab:', tabId);
+				return Promise.resolve();
+			};
+
+			// Create loading overlay and handle translation
+			injectScripts().then(() => {
+				console.log('Creating loading overlay for tab:', tabId);
+
+				// Create loading overlay
+				chrome.scripting.executeScript({
+					target: { tabId, frameIds: [0] },
+					func: (original) => {
+						console.log('Creating loading overlay with text:', original);
+						createOverlay('loading', original);
+					},
+					args: [info.selectionText]
+				}).then(() => {
+					console.log('Loading overlay created successfully');
+				}).catch(err => {
+					console.error('Loading overlay injection failed:', err.message);
+				});
+
+				// Handle translation with timeout
+				Promise.race([
+					translateText(info.selectionText, tab, 'selection'),
+					new Promise((_, reject) => setTimeout(() => reject(new Error('Translation timeout after 10s')), 10000))
+				]).then(result => {
+					console.log('✅ Translation succeeded, updating overlay with result');
+
+					chrome.scripting.executeScript({
+						target: { tabId, frameIds: [0] },
+						func: (original, translation) => {
+							console.log('Updating overlay with translation result');
+							createOverlay('translation', original, translation);
+						},
+						args: [info.selectionText, result]
+					}).then(() => {
+						console.log('Overlay updated with translation successfully');
+					}).catch(err => {
+						console.error('Overlay update failed:', err.message);
+					});
+				}).catch(error => {
+					console.error('❌ Translation failed, updating overlay with error:', error.message);
+
+					chrome.scripting.executeScript({
+						target: { tabId, frameIds: [0] },
+						func: (original, errorMessage) => {
+							console.log('Updating overlay with error');
+							createOverlay('error', original, errorMessage);
+						},
+						args: [info.selectionText, error.message]
+					}).then(() => {
+						console.log('Overlay updated with error successfully');
+					}).catch(err => {
+						console.error('Error overlay update failed:', err.message);
+					});
+				}).finally(() => {
+					// Reset translating flag
+					tabState.isTranslating = false;
+					console.log('🏁 Translation completed, flag reset');
+				});
+			}).catch(err => {
+				console.error('Script injection failed:', err.message);
+				tabState.isTranslating = false;
+			});
+		} else {
+			console.log('Invalid context menu call - missing selection, tab, or not in top-level frame');
+			logToPopup('Invalid context menu call - missing selection, tab, or not in top-level frame', 'warn');
+		}
+	});
+
+	// Clean up tab state on tab close
+	chrome.tabs.onRemoved.addListener((tabId) => {
+		console.log('Cleaning up tab state for tab:', tabId);
+		tabStates.delete(tabId);
+	});
+}
+
+// Simplified translateText
+async function translateText(text, tab = null, source = null) {
+	try {
+		const { apiKey } = await chrome.storage.sync.get(['apiKey']);
+		if (!apiKey) throw new Error('Please set your Gemini API key');
+
+		const translation = await translateWithGemini(text, apiKey);
+		const result = String(translation || 'Translation unavailable');
+
+		// For popup translations, store the result
+		if (source !== 'selection') {
+			chrome.storage.sync.set({
+				lastResult: result,
+			});
+		}
+
+		return result;
+	} catch (error) {
+		console.error(`❌ Translation failed`, error.message);
+		logToPopup(`Translation failed: ${error.message}`, 'error');
+		throw error;
+	}
+}
+
+async function translateWithGemini(text, apiKey, modelIndex = 0) {
+	if (modelIndex >= MODELS.length) {
+		console.error('🚫 All models exhausted');
+		logToPopup('All models exhausted', 'error');
+		throw new Error('All models exhausted. Check quotas or try later.');
+	}
+
+	const model = MODELS[modelIndex];
+	console.log(`🔄 [${modelIndex + 1}/${MODELS.length}] Trying ${model}: "${text.substring(0, 50)}..."`);
+
+	const prompt = `Check the grammar (with no explanations) of the following text (auto detect language). Respond with the corrected grammar or "Grammar OK." if it's OK.: 
+
+	${text}`;
+
+	try {
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s timeout per model
+
+		const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				contents: [{ parts: [{ text: prompt }] }],
+				generationConfig: {
+					temperature: 0,
+					maxOutputTokens: model.includes('pro') ? 150 : 300,
+					topP: 0.1,
+					topK: 1
+				},
+				safetySettings: []
+			}),
+			signal: controller.signal
+		});
+
+		clearTimeout(timeoutId);
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			let errorObj;
+			try {
+				errorObj = JSON.parse(errorText);
+				if (errorObj.error?.status === 'RESOURCE_EXHAUSTED') {
+					console.log(`❌ Quota exceeded on ${model}, trying next model...`);
+					return await translateWithGemini(text, apiKey, modelIndex + 1);
+				}
+				throw new Error(`API error: ${errorObj.error?.message || errorText}`);
+			} catch (e) {
+				console.log(`❌ HTTP ${response.status} on ${model}, trying next model...`);
+				return await translateWithGemini(text, apiKey, modelIndex + 1);
+			}
+		}
+
+		const data = await response.json();
+		const candidate = data.candidates?.[0];
+
+		if (candidate?.finishReason === 'MAX_TOKENS' || !candidate?.content?.parts?.[0]?.text) {
+			console.log(`❌ ${model} failed (${candidate?.finishReason || 'empty'}). Trying next...`);
+			return await translateWithGemini(text, apiKey, modelIndex + 1);
+		}
+
+		let translation = candidate.content.parts[0].text.trim();
+		console.log(`✅ ${model} SUCCESS: ${translation.substring(0, 100)}`);
+
+		translation = translation
+			.replace(/^```[\s\S]*?```/gs, '')
+			.replace(/^\*\*([^**]+)\*\*/g, '$1')
+			.replace(/^>?\s*/gm, '')
+			.replace(/Option \d*:?/gi, '')
+			.replace(/^\d+\.\s*/gm, '')
+			.replace(/\*\*(.+?)\*\*/g, '$1')
+			.replace(/\*(.+?)\*/g, '$1')
+			.replace(/\(.*?\)/g, '')
+			.replace(/\[.*?\]/g, '')
+			.replace(/\n{3,}/g, '\n\n')
+			.replace(/^(Here are|Here is|Translation:)/i, '')
+			.trim();
+
+		const paragraphs = translation.split('\n\n').filter(p => p.trim().length > 10);
+		if (paragraphs.length > 1) translation = paragraphs[0];
+
+		console.log(`🎉 ${model} FINAL RESULT (${modelIndex + 1}/${MODELS.length}): ${translation.substring(0, 100)}`);
+		return translation;
+	} catch (error) {
+		console.log(`❌ ${model} error: ${error.message}`);
+		if (error.name === 'AbortError') {
+			console.log(`⏰ ${model} timed out, trying next model...`);
+			return await translateWithGemini(text, apiKey, modelIndex + 1);
+		}
+		if (error.message.includes('RESOURCE_EXHAUSTED') || error.message.includes('Quota exceeded')) {
+			console.log(`📊 Quota exceeded on ${model}, trying next model...`);
+			return await translateWithGemini(text, apiKey, modelIndex + 1);
+		}
+		throw error;
+	}
+}
